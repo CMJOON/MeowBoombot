@@ -1,0 +1,480 @@
+import logging
+import random
+import asyncio
+from typing import Dict, List, Optional
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+
+# 启用日志
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# 卡牌类型
+CARD_TYPES = {
+    'exploding_kitten': '💣 炸弹猫',
+    'defuse': '🛡️ 拆弹',
+    'skip': '⏭️ 跳过',
+    'attack': '⚔️ 攻击',
+    'see_future': '🔮 预知未来',
+    'shuffle': '🔀 洗牌',
+    'favor': '🤝 恩惠',
+    'nope': '❌ 拒绝',
+    'normal_cat': '🐱 普通猫',
+}
+
+class Card:
+    def __init__(self, card_type: str):
+        self.type = card_type
+        self.name = CARD_TYPES[card_type]
+    
+    def __str__(self):
+        return self.name
+
+class Player:
+    def __init__(self, user_id: int, username: str):
+        self.user_id = user_id
+        self.username = username
+        self.hand = []
+        self.is_alive = True
+        self.turns_to_take = 1
+    
+    def add_card(self, card: Card):
+        self.hand.append(card)
+    
+    def remove_card(self, card_type: str) -> Optional[Card]:
+        for i, card in enumerate(self.hand):
+            if card.type == card_type:
+                return self.hand.pop(i)
+        return None
+    
+    def has_card(self, card_type: str) -> bool:
+        return any(card.type == card_type for card in self.hand)
+    
+    def get_hand_display(self) -> str:
+        if not self.hand:
+            return "手牌为空"
+        hand_counts = {}
+        for card in self.hand:
+            hand_counts[card.name] = hand_counts.get(card.name, 0) + 1
+        return '\n'.join([f"{name}: {count}" for name, count in hand_counts.items()])
+
+class Game:
+    def __init__(self, chat_id: int):
+        self.chat_id = chat_id
+        self.players = {}
+        self.deck = []
+        self.discard_pile = []
+        self.current_player_index = 0
+        self.game_started = False
+        self.turn_direction = 1
+        self.waiting_for_action = False
+        self.last_played_card = None
+    
+    def add_player(self, user_id: int, username: str):
+        if user_id not in self.players and len(self.players) < 5:
+            self.players[user_id] = Player(user_id, username)
+            return True
+        return False
+    
+    def remove_player(self, user_id: int):
+        if user_id in self.players:
+            del self.players[user_id]
+    
+    def create_deck(self):
+        # 根据玩家数量创建牌组
+        num_players = len(self.players)
+        
+        # 基础牌组
+        cards = []
+        
+        # 添加炸弹猫 (比玩家数少1张)
+        for _ in range(num_players - 1):
+            cards.append(Card('exploding_kitten'))
+        
+        # 添加拆弹卡 (每人1张，多1张)
+        for _ in range(num_players + 1):
+            cards.append(Card('defuse'))
+        
+        # 添加其他卡牌
+        other_cards = [
+            ('skip', 4), ('attack', 4), ('see_future', 5),
+            ('shuffle', 4), ('favor', 4), ('nope', 5), ('normal_cat', 4)
+        ]
+        
+        for card_type, count in other_cards:
+            for _ in range(count):
+                cards.append(Card(card_type))
+        
+        # 洗牌
+        random.shuffle(cards)
+        self.deck = cards
+    
+    def deal_cards(self):
+        # 每个玩家发7张牌（包含1张拆弹卡）
+        for player in self.players.values():
+            player.add_card(Card('defuse'))
+            for _ in range(6):
+                if self.deck:
+                    player.add_card(self.deck.pop())
+    
+    def get_current_player(self) -> Optional[Player]:
+        alive_players = [p for p in self.players.values() if p.is_alive]
+        if not alive_players:
+            return None
+        return alive_players[self.current_player_index % len(alive_players)]
+    
+    def next_turn(self):
+        alive_players = [p for p in self.players.values() if p.is_alive]
+        if len(alive_players) <= 1:
+            return
+        
+        current = self.get_current_player()
+        if current and current.turns_to_take > 1:
+            current.turns_to_take -= 1
+        else:
+            self.current_player_index = (self.current_player_index + self.turn_direction) % len(alive_players)
+            current = self.get_current_player()
+            if current:
+                current.turns_to_take = 1
+    
+    def draw_card(self, player: Player) -> Card:
+        if not self.deck:
+            return None
+        
+        card = self.deck.pop(0)
+        if card.type == 'exploding_kitten':
+            if player.has_card('defuse'):
+                # 使用拆弹卡
+                defuse = player.remove_card('defuse')
+                self.discard_pile.append(defuse)
+                # 将炸弹猫放回牌堆随机位置
+                if self.deck:
+                    pos = random.randint(0, len(self.deck))
+                    self.deck.insert(pos, card)
+                else:
+                    self.deck.append(card)
+                return Card('defuse')  # 返回拆弹卡表示安全
+            else:
+                # 玩家被淘汰
+                player.is_alive = False
+                return card
+        else:
+            player.add_card(card)
+            return card
+    
+    def get_game_status(self) -> str:
+        alive_players = [p for p in self.players.values() if p.is_alive]
+        status = f"🎮 游戏状态\n"
+        status += f"👥 存活玩家: {len(alive_players)}\n"
+        status += f"🃏 剩余卡牌: {len(self.deck)}\n\n"
+        
+        current = self.get_current_player()
+        if current:
+            status += f"🎯 当前回合: @{current.username}\n"
+            if current.turns_to_take > 1:
+                status += f"⏰ 剩余回合数: {current.turns_to_take}\n"
+        
+        return status
+
+# 全局游戏管理器
+games: Dict[int, Game] = {}
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """开始游戏命令"""
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    
+    if chat_id not in games:
+        games[chat_id] = Game(chat_id)
+    
+    game = games[chat_id]
+    
+    if game.game_started:
+        await update.message.reply_text("游戏已经开始了！")
+        return
+    
+    if game.add_player(user.id, user.username or user.first_name):
+        await update.message.reply_text(f"@{user.username or user.first_name} 加入了游戏！\n"
+                                      f"当前玩家数: {len(game.players)}/5\n"
+                                      f"使用 /join 加入游戏，/start_game 开始游戏")
+    else:
+        await update.message.reply_text("你已经在游戏中了，或者游戏人数已满！")
+
+async def join_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """加入游戏命令"""
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    
+    if chat_id not in games:
+        await update.message.reply_text("还没有游戏开始！使用 /start 创建游戏")
+        return
+    
+    game = games[chat_id]
+    
+    if game.game_started:
+        await update.message.reply_text("游戏已经开始了，无法再加入！")
+        return
+    
+    if game.add_player(user.id, user.username or user.first_name):
+        await update.message.reply_text(f"@{user.username or user.first_name} 加入了游戏！\n"
+                                      f"当前玩家数: {len(game.players)}/5")
+    else:
+        await update.message.reply_text("你已经在游戏中了，或者游戏人数已满！")
+
+async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """开始游戏"""
+    chat_id = update.effective_chat.id
+    
+    if chat_id not in games:
+        await update.message.reply_text("还没有游戏！使用 /start 创建游戏")
+        return
+    
+    game = games[chat_id]
+    
+    if len(game.players) < 2:
+        await update.message.reply_text("至少需要2个玩家才能开始游戏！")
+        return
+    
+    if game.game_started:
+        await update.message.reply_text("游戏已经开始了！")
+        return
+    
+    # 初始化游戏
+    game.create_deck()
+    game.deal_cards()
+    game.game_started = True
+    
+    # 发送游戏开始消息
+    players_list = '\n'.join([f"@{p.username}" for p in game.players.values()])
+    await update.message.reply_text(f"🎮 炸弹猫游戏开始！\n\n"
+                                  f"参与玩家:\n{players_list}\n\n"
+                                  f"{game.get_game_status()}\n"
+                                  f"轮到 @{game.get_current_player().username} 行动！")
+    
+    # 发送行动按钮
+    keyboard = [
+        [InlineKeyboardButton("🎲 抽牌", callback_data="draw")],
+        [InlineKeyboardButton("🃏 查看手牌", callback_data="show_hand")],
+        [InlineKeyboardButton("🎯 使用卡牌", callback_data="use_card")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("选择你的行动:", reply_markup=reply_markup)
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理按钮点击"""
+    query = update.callback_query
+    await query.answer()
+    
+    chat_id = query.message.chat_id
+    user_id = query.from_user.id
+    
+    if chat_id not in games:
+        await query.edit_message_text("游戏不存在！")
+        return
+    
+    game = games[chat_id]
+    current_player = game.get_current_player()
+    
+    if not current_player or current_player.user_id != user_id:
+        await query.edit_message_text("不是你的回合！")
+        return
+    
+    action = query.data
+    
+    if action == "draw":
+        # 抽牌
+        card = game.draw_card(current_player)
+        if not card:
+            await query.edit_message_text("牌堆已空！")
+            return
+        
+        if card.type == 'exploding_kitten':
+            # 玩家被淘汰
+            await query.edit_message_text(f"💥 @{current_player.username} 抽到了炸弹猫，被淘汰了！")
+            
+            # 检查游戏是否结束
+            alive_players = [p for p in game.players.values() if p.is_alive]
+            if len(alive_players) == 1:
+                winner = alive_players[0]
+                await context.bot.send_message(chat_id, f"🎉 游戏结束！@{winner.username} 获胜！")
+                del games[chat_id]
+                return
+        elif card.type == 'defuse':
+            await query.edit_message_text(f"🛡️ @{current_player.username} 使用拆弹卡化解了炸弹猫！")
+        else:
+            await query.edit_message_text(f"@{current_player.username} 抽到了 {card}")
+        
+        # 下一个玩家的回合
+        game.next_turn()
+        next_player = game.get_current_player()
+        if next_player:
+            keyboard = [
+                [InlineKeyboardButton("🎲 抽牌", callback_data="draw")],
+                [InlineKeyboardButton("🃏 查看手牌", callback_data="show_hand")],
+                [InlineKeyboardButton("🎯 使用卡牌", callback_data="use_card")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await context.bot.send_message(chat_id, 
+                                         f"{game.get_game_status()}\n轮到 @{next_player.username} 行动！",
+                                         reply_markup=reply_markup)
+    
+    elif action == "show_hand":
+        # 显示手牌
+        hand_display = current_player.get_hand_display()
+        await query.edit_message_text(f"🃏 你的手牌:\n{hand_display}")
+    
+    elif action == "use_card":
+        # 使用卡牌菜单
+        if not current_player.hand:
+            await query.edit_message_text("你没有可用的卡牌！")
+            return
+        
+        # 创建卡牌使用按钮
+        unique_cards = {}
+        for card in current_player.hand:
+            if card.type not in ['exploding_kitten', 'defuse']:  # 这些卡不能主动使用
+                unique_cards[card.type] = card.name
+        
+        if not unique_cards:
+            await query.edit_message_text("你没有可以使用的卡牌！")
+            return
+        
+        keyboard = []
+        for card_type, card_name in unique_cards.items():
+            keyboard.append([InlineKeyboardButton(card_name, callback_data=f"play_{card_type}")])
+        keyboard.append([InlineKeyboardButton("❌ 取消", callback_data="cancel")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text("选择要使用的卡牌:", reply_markup=reply_markup)
+    
+    elif action.startswith("play_"):
+        # 使用特定卡牌
+        card_type = action[5:]  # 去掉 "play_" 前缀
+        
+        if not current_player.has_card(card_type):
+            await query.edit_message_text("你没有这张卡牌！")
+            return
+        
+        used_card = current_player.remove_card(card_type)
+        game.discard_pile.append(used_card)
+        
+        # 执行卡牌效果
+        await execute_card_effect(context, game, current_player, card_type, query)
+    
+    elif action == "cancel":
+        # 取消操作，返回主菜单
+        keyboard = [
+            [InlineKeyboardButton("🎲 抽牌", callback_data="draw")],
+            [InlineKeyboardButton("🃏 查看手牌", callback_data="show_hand")],
+            [InlineKeyboardButton("🎯 使用卡牌", callback_data="use_card")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text("选择你的行动:", reply_markup=reply_markup)
+
+async def execute_card_effect(context, game, player, card_type, query):
+    """执行卡牌效果"""
+    chat_id = game.chat_id
+    
+    if card_type == 'skip':
+        await query.edit_message_text(f"⏭️ @{player.username} 使用了跳过卡，结束回合！")
+        game.next_turn()
+    
+    elif card_type == 'attack':
+        await query.edit_message_text(f"⚔️ @{player.username} 使用了攻击卡，下个玩家需要额外抽一张牌！")
+        game.next_turn()
+        next_player = game.get_current_player()
+        if next_player:
+            next_player.turns_to_take = 2
+    
+    elif card_type == 'see_future':
+        top_cards = game.deck[:3] if len(game.deck) >= 3 else game.deck[:]
+        future_text = "🔮 未来3张牌:\n" + '\n'.join([f"{i+1}. {card}" for i, card in enumerate(top_cards)])
+        await query.edit_message_text(f"@{player.username} 使用了预知未来！\n{future_text}")
+    
+    elif card_type == 'shuffle':
+        random.shuffle(game.deck)
+        await query.edit_message_text(f"🔀 @{player.username} 使用了洗牌卡，牌堆被重新洗牌！")
+    
+    elif card_type == 'favor':
+        # 简化版：随机从其他玩家那里获得一张牌
+        alive_players = [p for p in game.players.values() if p.is_alive and p != player]
+        if alive_players and any(p.hand for p in alive_players):
+            target = random.choice([p for p in alive_players if p.hand])
+            if target.hand:
+                stolen_card = target.hand.pop(random.randint(0, len(target.hand)-1))
+                player.add_card(stolen_card)
+                await query.edit_message_text(f"🤝 @{player.username} 使用了恩惠卡，从 @{target.username} 那里获得了一张 {stolen_card}！")
+        else:
+            await query.edit_message_text(f"🤝 @{player.username} 使用了恩惠卡，但没有目标可以选择！")
+    
+    # 如果不是跳过卡或攻击卡，继续当前玩家的回合
+    if card_type not in ['skip', 'attack']:
+        keyboard = [
+            [InlineKeyboardButton("🎲 抽牌", callback_data="draw")],
+            [InlineKeyboardButton("🃏 查看手牌", callback_data="show_hand")],
+            [InlineKeyboardButton("🎯 使用卡牌", callback_data="use_card")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await context.bot.send_message(chat_id, "继续你的回合:", reply_markup=reply_markup)
+    else:
+        # 切换到下一个玩家
+        next_player = game.get_current_player()
+        if next_player:
+            keyboard = [
+                [InlineKeyboardButton("🎲 抽牌", callback_data="draw")],
+                [InlineKeyboardButton("🃏 查看手牌", callback_data="show_hand")],
+                [InlineKeyboardButton("🎯 使用卡牌", callback_data="use_card")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await context.bot.send_message(chat_id, 
+                                         f"{game.get_game_status()}\n轮到 @{next_player.username} 行动！",
+                                         reply_markup=reply_markup)
+
+async def game_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """显示游戏状态"""
+    chat_id = update.effective_chat.id
+    
+    if chat_id not in games:
+        await update.message.reply_text("没有正在进行的游戏！")
+        return
+    
+    game = games[chat_id]
+    
+    if not game.game_started:
+        players_list = '\n'.join([f"@{p.username}" for p in game.players.values()])
+        await update.message.reply_text(f"游戏尚未开始\n\n参与玩家:\n{players_list}\n\n使用 /start_game 开始游戏")
+    else:
+        await update.message.reply_text(game.get_game_status())
+
+async def end_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """结束游戏"""
+    chat_id = update.effective_chat.id
+    
+    if chat_id in games:
+        del games[chat_id]
+        await update.message.reply_text("游戏已结束！")
+    else:
+        await update.message.reply_text("没有正在进行的游戏！")
+
+def main():
+    """启动机器人"""
+    # 在这里替换为你的Bot Token
+    TOKEN = "7755544392:AAFtF8m9d0bGN3AjeVoqfiAxPg2gogoVOaU"
+    
+    # 创建应用
+    application = Application.builder().token(TOKEN).build()
+    
+    # 添加处理器
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("join", join_game))
+    application.add_handler(CommandHandler("start_game", start_game))
+    application.add_handler(CommandHandler("status", game_status))
+    application.add_handler(CommandHandler("end", end_game))
+    application.add_handler(CallbackQueryHandler(button_callback))
+    
+    # 启动机器人
+    print("炸弹猫游戏Bot启动中...")
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
